@@ -1,0 +1,236 @@
+
+require:
+   quaint/lib/abstract-ast
+   ;; quaint/lib/engine -> Dispatcher
+   opg ->
+      Source
+      transfer-location as [<<:]
+      tokenize ->
+         Tokenizer, infer-location
+      parse as xyz ->
+         Parser, TokenGroups, PriorityOrder
+
+provide:
+   parse
+   QAst, Text, Oper, Seq
+   Dispatcher
+
+
+tokenizer = Tokenizer with {
+   regexps = {
+      #open{"[\\(\\[\\{]"}
+      #close{"[\\)\\]\\}]"}
+      #word{"(?:[A-Za-z0-9.]|\\\\.)+"}
+      #infix{"[!@#$%^&*\\-+=<>?|~:_]+"}
+      #sep{"[,;]"}
+      #space{"[\n ]+"}
+   }
+   post = {
+      {token, i, tokens} ->
+         if token.type === .infix
+            \ and tokens[i - 1].type === .infix:
+            token.type = .prefix
+         token
+      infer-location
+   }
+}
+
+groups = TokenGroups with {
+   comma = {"sep ,", "sep ;"}
+   lit = {"word"}
+   open = {"open"}
+   close = {"close"}
+   juxt = {"space"}
+   other = {f} where f(token) = token.type === .infix or token.type == .prefix
+}
+
+prio = PriorityOrder(groups) with {
+    open = {left = 1000, right = 0}
+    close = {left = 0, right = 10000}
+    comma = {left = 15, right = 15}
+    other = {left = 300, right = 301}
+    juxt = {left = 500, right = 500}
+    lit = {left = 5000, right = 5000}
+}
+
+finalize(match node) =
+   {null?, mid and {=> token, => location, => type}, null?} ->
+      rval = Text(token) <<: location
+      rval &: {operator-token = type != .word}
+   else ->
+      res = Seq(*elems) where elems =
+         enumerate(node) each {match i, x} ->
+            when (i mod 2) === 0 ->
+               x or Text("")
+            else ->
+               Oper(x.token) &: {operator-token = true}
+      res &: {operator = res[1][0]}
+      res
+
+parser = opg.parse.Parser(tokenizer, prio.get-order(), finalize)
+
+parse(match src) =
+   {=> text} ->
+      parser.parse(text)
+   else ->
+      parser.parse(src)
+
+ast = abstract-ast(parse)
+{=> QAst, => Text, => Oper, => Seq} = ast
+
+
+findInsert{xs, x, ord} =
+   var lo = 0
+   var hi = xs.length - 1
+   while lo <= hi:
+      mid = lo + [[hi - lo] // 2]
+      match ord{xs[mid], x}:
+         < 0  -> lo = mid + 1
+         > 0  -> hi = mid - 1
+         else -> return {mid, true}
+   {lo, false}
+
+insertSorted{xs, x, ord} =
+   {idx, replace} = findInsert{xs, x, ord}
+   xs.splice{idx, if{replace, 1, 0}, x}
+
+parseSpec{match} =
+   String? spec ->
+      let ast = parse{Source{spec}}
+      ;; var top = null
+      var specificity = 0
+      rval = helper{ast, {shed = true}} where helper{match expr, opts} =
+         Text? {R"^\\(?:([^\\]*)\\)?(.*)$"! {_, match flag, name}} ->
+            "maybe" -> #put{name, true}
+            else -> #put{name, false}
+         Text? ->
+            specificity += 100
+            #eq{expr}
+         Oper? ->
+            #eq{expr}
+         Seq? {*args} and {=> operator} ->
+            specificity += 1
+            ;; if [not top]:
+            ;;    top = operator
+            #seq{*[args each arg -> helper{arg, opts}]}
+      top = ast.key{}
+      {top, rval, specificity}
+   {top, rval, specificity} ->
+      {top, rval, specificity}
+
+makeExtractor{parseSpec! {top, tree, specificity}} =
+   helper{match x, node} =
+      #put{v, _maybe = true} ->
+         match node:
+            Text? {""} when not _maybe ->
+               false
+            else ->
+               {v => node}
+      #eq{match} ->
+         == node -> {=}
+         else -> false
+      #seq{*subtrees} ->
+         match node:
+            Seq? {*args} when subtrees.length == args.length ->
+               rval = {=}
+               zip{subtrees, args} each {subtree, arg} ->
+                  match helper{subtree, arg}:
+                     false? ->
+                        return false
+                     vars ->
+                        rval &: vars
+               rval
+            other ->
+               false
+      #fn{f} ->
+         f{node}
+   {top, specificity, fn} where
+      fn{node} = helper{tree, node}
+
+ruleBank = {=}
+
+extractor{*match} =
+   {rules and not String?} ->
+      extractors = items{rules} each {name, match rule} ->
+         when ruleBank[rule] -> {name, ruleBank[rule]}
+         else ->
+            {_, _, ex} = makeExtractor{rule}
+            ruleBank[rule] = ex
+            {name, ex}
+      f{node} =
+         extractors each {name, ex} ->
+            if [res = ex{node}]:
+               return res &: {_which = name}
+         return false
+      f[Symbol.project-no-exc]{x} =
+         match f{x}:
+            === false ->
+               {false, null}
+            values ->
+               {true, values}
+      f
+   rules ->
+      extractor{object with enumerate{rules}}
+
+class Spec:
+   constructor{makeExtractor! {@operator, @specificity, @extractor}, @gen} =
+      pass
+   [^Symbol.project-no-exc]{@extractor! match} =
+      false? ->
+         {false, null}
+      values ->
+         {true, values}
+
+class Dispatcher:
+
+   constructor{} =
+      @dispatch = {}
+
+   gen handlers{node} =
+      key = node.key{} ;; node.operator or ""
+      if not key:
+         console.error with
+            "Node lacks an operator key. That may be indicative of a bug."
+      match @dispatch[key]:
+         undefined? ->
+            false
+         candidates ->
+            candidates each c ->
+               match node:
+                  c! parts ->
+                     yield {parts, c}
+                  else ->
+                     pass
+            false
+
+   register{*match} =
+      {Spec? handler} ->
+         key = handler.operator
+         l = [@dispatch[key] or= {}]
+         insertSorted{l, handler} with
+            {{specificity => match s1}, {specificity => s2}} ->
+               ;; Do not return 0 because it will cause a replacement
+               > s2 -> -1
+               else -> 1
+      {rule, fn} ->
+         @register{Spec{rule, fn}}
+
+   clone{} =
+      d = Dispatcher{}
+      d.dispatch = object with items{@dispatch} each {key, l} ->
+         {key, l.slice{0}}
+      d
+
+
+;; main() where main() =
+;;    let d = Dispatcher()
+;;    d.register("\\a + \\b") with {} -> .hello
+;;    d.register("x + \\a") with {} -> .doop
+
+;;    ;; resu = parse("hello + there")
+;;    ;; print ast.parse-spec("\\a + \\b")
+;;    ;; print resu
+;;    ;; print resu.extract("hello + \\b")
+
+;;    d.handlers(parse("x + there")) each {args, spec} ->
+;;       print spec.gen()

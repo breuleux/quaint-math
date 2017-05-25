@@ -1,0 +1,17 @@
+
+require:
+   inquirer-shortcuts as inq
+   chalk
+
+
+async quaint-setup(config, instructions) =
+   url = "https://github.com/breuleux/quaint-math"
+   print 'Plugin documentation: {chalk.bold.cyan(url)}'
+
+   data = config.plugins["math"] or= {=}
+
+   ;; Configure the plugin using inq.input, inq.confirm, inq.list, and so on.
+   ;; data.thing = await inq.input("Something", {default = "whatever"})
+
+
+provide = quaint-setup

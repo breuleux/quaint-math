@@ -1,0 +1,209 @@
+
+require:
+   language-wizard
+
+cfg = """
+window.MathJax = {
+  tex2jax: {
+    inlineMath: [ ['~~~$+','+$~~~'] ],
+    displayMath: [ ['~~~$$','$$~~~'] ],
+    processEscapes: true
+  },
+  TeX: {
+    equationNumbers: {
+       autoNumber: 'AMS'
+    }
+  }
+};
+"""
+
+cdn = "https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.0/MathJax.js?config=TeX-AMS-MML_HTMLorMML"
+
+lang = language-wizard with {definitions = ___} with """
+C open:  ( [ {
+C close: } ]
+C close: )
+C sep:   , ;
+S esc:   \\BACKSLASH \\ANY
+W word:  A-Z a-z 0-9 . \\esc
+W ochar: ! @ # $ % ^ & * + - = < > / ? | ~ : _
+* mbsp:  \\SPACE
+S infix: \\mbsp \\ochar \\mbsp
+W space: \\NEWLINE \\SPACE
+O: 5000 \\word   5000
+O: 1000 \\open   0    \\close 10000
+O: 300  \\infix  301
+O: 500  \\space  500
+O: 15   \\sep    15
+"""
+
+math-engine() =
+   d = lang.Dispatcher()
+
+   sum-like(operator, engine, arg) =
+      params = arg.extract("\\from, \\to, \\body", "\\from, \\body", "\\body")
+      res = {operator}
+      if params.from:
+         res.push("_{", engine.gen(params.from), "}")
+      if params.to:
+         res.push("^{", engine.gen(params.to), "}")
+      res.push(engine.gen(params.body))
+      res
+
+   rules = {
+      "\\maybe\\node"(engine, {node => match node}) =
+         ;; do:
+         ;;    print node.sexp(true)
+         lang.Seq? ->
+            node each part ->
+               engine.gen(part)
+         lang.Text? ->
+            node.raw().split(R"( +)") each match text ->
+               undefined? ->
+                  ""
+               R"^\\"? ->
+                  engine.gen(engine._eng.eval(text[1..], {=}))
+               R"^( *|.|[0-9.]+)$"? ->
+                  text
+               else ->
+                  '\\text\{{text}\}'
+      "[\\x]"(engine, {=> x}) =
+         engine.gen(x)
+      "[[\\x]]"(engine, {=> x}) =
+         {"[", engine.gen(x), "]"}
+      "[[[\\x]]]"(engine, {=> x}) =
+         {"\\left[", engine.gen(x), "\\right]"}
+      "{\\x}"(engine, {=> x}) =
+         x.raw()
+      "{{\\x}}"(engine, {=> x}) =
+         {"\\{", engine.gen(x), "\\}"}
+      "{{{\\x}}"(engine, {=> x}) =
+         {"\\left\\{", engine.gen(x), "\\right\\}"}
+      "((\\x))"(engine, {=> x}) =
+         {"\\left(", engine.gen(x), "\\right)"}
+      "\\x _ \\y"(engine, {=> x, => y}) =
+         {"{", engine.gen(x), "}_{", engine.gen(y), "}"}
+      "\\x ^ \\y"(engine, {=> x, => y}) =
+         {"{", engine.gen(x), "}^{", engine.gen(y), "}"}
+      "\\x / \\y"(engine, {=> x, => y}) =
+         {"\\frac{", engine.gen(x), "}{", engine.gen(y), "}"}
+
+      "in"(engine, _) =
+         "\\in"
+      "forall"(engine, _) =
+         "\\forall"
+      "exists"(engine, _) =
+         "\\exists"
+      "infty"(engine, _) =
+         "\\infty"
+
+      "Prob(\\x)"(engine, {=> x}) =
+         {"\\text{P}(", engine.gen(x), ")"}
+
+      "Sum(\\arg)"(engine, {=> arg}) =
+         sum-like("\\sum", engine, arg)
+      "Prod(\\arg)"(engine, {=> arg}) =
+         sum-like("\\prod", engine, arg)
+      "Int(\\arg)"(engine, {=> arg}) =
+         sum-like("\\int", engine, arg)
+      "Lim(\\arg)"(engine, {=> arg}) =
+         sum-like("\\lim", engine, arg)
+      "Expect(\\arg)"(engine, {=> arg}) =
+         sum-like("\\mathop{\\mathbb{E}}", engine, arg)
+   }
+   items(rules) each {r, f} ->
+      d.register(r, f)
+   d
+
+
+install(@, options) =
+   ;; Plugin code goes here.
+   ;; TIP: you can test your plugin with the command:
+   ;; quaint -p ./lib -e 'code that uses your custom rule or macro'
+
+   @register-resources with {
+      "mathjax/config.js" => {
+         contents = cfg
+         inline = true
+         path = null
+         type = .js
+         method = .head
+      }
+      cdn => {
+         path = cdn
+         path-is-url = true
+         contents = false
+         type = .js
+         method = .head
+      }
+   }
+
+   collapse(match x) =
+      Array? ->
+         x.map(collapse).join("")
+      String? ->
+         x
+      Number? ->
+         String{x}
+      else ->
+         throw E.illegal-generated-data()
+
+   meng = math-engine(@fork())
+   mgen(engine, x) =
+      collapse((meng &: {_eng = engine}).gen(lang.parse(x.raw())))
+
+   @register-rules with {
+      "\\rule $=>$ \\body"{engine, {rule => rule >> rule.shed().raw()
+                                    body => body >> body.shed()}} =
+         meng.register(rule) with {meng, values} ->
+            e = engine.fork().setenv(values)
+            (meng &: {_eng = e}).gen(lang.parse(body.raw()))
+         ""
+
+      "$+ \\math"{engine, {=> math}} =
+         m = mgen(engine, math) ;;meng.gen(lang.parse(math.raw()))
+         {"~~~$+", raw % m, "+$~~~"}
+
+      "\\maybe\\descr $$ \\math"{engine, {=> descr, => math}} =
+         ;; The "X" guarantees that type will not be a class or id
+         {var type, *cls} = ["X" + descr.raw{}.trim{}].split{R"(?=[.#])"}
+         type = type[1..] or "align" ;; we strip the "X" out here
+         parts = math.statements{} each stmt ->
+            match stmt.extract{"* \\nonum", "\\maybe\\tag # \\num", "\\other"}:
+               {=> nonum} ->
+                  res = mgen(engine, nonum)
+                  '{res}\\nonumber\\\\'
+               {=> tag >> tag.raw{}.trim{}, => num} ->
+                  res = mgen(engine, num)
+                  match tag:
+                     "" -> res + "\\\\"
+                     else -> '{res}\\label\{{tag}\}\\tag\{{tag}\}\\\\'
+               {=> other} ->
+                  ;; collapse(meng.gen(lang.parse(other.raw())))
+                  mgen(engine, other)
+         contents = parts.join{"\n"}.replace{R"\\\\$", ""}
+         value =
+            if type === 'raw':
+               contents
+            else:
+               '\\begin\{{type}\}\n{contents}\n\\end\{{type}\}'
+         core = {"~~~$$", raw % value, "$$~~~"}
+         if cls.length:
+            ENode{{.div, *cls}, {=}, core}
+         else:
+            core
+
+      "$@ \\ref"{engine, {=> ref}} =
+         r = '\\ref\{{ref.raw{}}\}'
+         {"~~~$+", raw % r, "+$~~~"}
+
+   }
+
+main(*match) =
+   {@, options = {=}} when @is-quaint-engine ->
+      install(@, options)
+   {options = {=}} ->
+      {@} -> main(@, options)
+
+provide = main
+
