@@ -9,7 +9,8 @@
   },
   "keywords": [
     "quaint",
-    "quaint-plugin"
+    "quaint-plugin",
+    "mathjax"
   ],
   "author": "Olivier Breuleux",
   "license": "MIT",
@@ -19,7 +20,7 @@
     "earlgrey-runtime": "^0.1.0",
     "inquirer-shortcuts": "^1.1.0",
     "opg": "0.0.5",
-    "quaint": "^0.1.1"
+    "language-wizard": "0.1.0"
   },
   "devDependencies": {
     "earlgrey": "^0.1.0",
